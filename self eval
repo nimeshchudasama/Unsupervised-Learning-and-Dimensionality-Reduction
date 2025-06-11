@@ -65,7 +65,7 @@ CREATE TABLE STG_COVERAGE_DIM (
 /*======================================================================
   CLIENT_DIM snapshot (covers original Q4, 12, 16-18, 25-30, 38-39, 43-45, 47)
 ======================================================================*/
-WITH client_base AS (                          -- Q04 / 47
+WITH client_base AS (                -- Q04 / 47
     SELECT  ECI,
             UCN,
             NVL(shortName, name)          AS client_name,
@@ -73,41 +73,40 @@ WITH client_base AS (                          -- Q04 / 47
             primaryCRUGroupIdentifier     AS cru_group,
             primaryCRUSectorIdentifier    AS cru_sector
     FROM    "REFERENCE DATA".Client.Restricted."v_creditClientConsumable"
-    WHERE   CIT_EOP_CONTEXT_KEY = :RDR_CTX_KEY
-      AND   ECI IN (:CLIENT_OIDS)
+    WHERE   CIT_EOP_CONTEXT_KEY = ?
+      AND   ECI IN (?)                   -- client list
 ),
-family_counts AS (                             -- Q12 / 39
+family_counts AS (                     -- Q12 / 39
     SELECT  creditUltimateParentECI AS parent_eci,
             COUNT(*)                AS num_clients_in_family
     FROM    "REFERENCE DATA".Client.Restricted."v_creditClientConsumable"
-    WHERE   CIT_EOP_CONTEXT_KEY = :RDR_CTX_KEY
+    WHERE   CIT_EOP_CONTEXT_KEY = ?
     GROUP BY creditUltimateParentECI
 ),
-c_flag AS (                                    -- Q16 / 17
+c_flag AS (                            -- Q16 / 17
     SELECT  ECI,
-            MAX(effectiveToDate)   AS c_flag_expiry
+            MAX(effectiveToDate) AS c_flag_expiry
     FROM    "REFERENCE DATA".Client.Restricted."v_clientCreditFlag"
     WHERE   creditflagIdentifier = 'C'
     GROUP   BY ECI
 ),
-casid AS (                                     -- Q28
+casid AS (                             -- Q28
     SELECT  ECI,
-            MAX(CASID)            AS casid
+            MAX(CASID)        AS casid
     FROM    "REFERENCE DATA".Client.Restricted."v_creditClient"
     WHERE   effectiveToDate > CURRENT_DATE
     GROUP   BY ECI
 ),
-iid AS (                                       -- Q25 / 26
+iid AS (                               -- Q25 / 26
     SELECT  ECI,
             MAX(clientInternalIdentifier) AS client_internal_id
     FROM    "REFERENCE DATA".Client.Unrestricted."v_clientECI"
     WHERE   CURRENT_DATE BETWEEN effectiveFromDate AND effectiveToDate
     GROUP   BY ECI
 ),
-fam_names AS (                                 -- Q18 / 27 / 38
+fam_names AS (                         -- Q18 / 27 / 38
     SELECT  ECI,
-            LISTAGG(DISTINCT familyName, ',')
-              WITHIN GROUP (ORDER BY familyName) AS family_names
+            LISTAGG(DISTINCT familyName, ',') AS family_names
     FROM    "REFERENCE DATA".Client.Restricted."v_clientHierarchy"
     WHERE   CURRENT_DATE BETWEEN effectiveFromDate AND effectiveToDate
     GROUP   BY ECI
@@ -135,7 +134,7 @@ LEFT JOIN   fam_names    fn    ON fn.eci        = cb.eci;
 /*======================================================================
   FACILITY_DIM snapshot (covers Q1-3, 5-11, 13, 24)
 ======================================================================*/
-WITH facility_core AS (                        -- Q01 / 02 / 03
+WITH facility_core AS (            -- original Q01 / 02 / 03
     SELECT  creditFacilityIdentifier                  AS facility_id,
             creditFacilityInternalIdentifier          AS facility_oid,
             creditFacilityPrimaryOwnerClientIdentifier AS client_oid,
@@ -145,61 +144,63 @@ WITH facility_core AS (                        -- Q01 / 02 / 03
             creditFacilityLossGivenDefaultPercentage  AS facility_lgd,
             facility_report_code                      AS regulatory_flag
     FROM    "REFERENCE DATA"."Credit Facility".Restricted."v_creditFacilityLatest"
-    WHERE   EOM_CONTEXT_KEY          = :CONTEXT_KEY
+    WHERE   EOM_CONTEXT_KEY          = ?            -- bind-param ①
       AND   creditFacilityStatusCode = 'Active'
-      AND   creditFacilityIdentifier IN (:FACILITY_IDS)
+      AND   creditFacilityIdentifier IN (?)         -- bind-param ② (array)
 ),
-dg_lgd AS (                                      -- Q07
+dg_lgd AS (                          -- Q07
     SELECT creditFacilityIdentifier
     FROM   "REFERENCE DATA"."Credit Facility".Restricted."v_creditFacilityLatest"
-    WHERE  EOM_CONTEXT_KEY          = :CONTEXT_KEY
+    WHERE  EOM_CONTEXT_KEY          = ?
       AND  creditFacilityStatusCode = 'Active'
       AND  RTRIM(creditFacilityDefaultGradeDerivationCodeIndicator) IN ('7','8')
       AND  creditFacilityLossGivenDefaultPercentage IN (5,10)
 ),
-obligor AS (                                    -- Q05 / 24
+obligor AS (                         -- Q05 / 24
     SELECT  c.creditFacilityIdentifier AS facility_id,
-            NVL(c.creditFacilityDefaultGradeDerivationCodeIndicator,
-                o.obligorGrade)        AS obligor_grade
+            COALESCE(                                        -- NVL→COALESCE
+                c.creditFacilityDefaultGradeDerivationCodeIndicator,
+                o.obligorGrade
+            ) AS obligor_grade
     FROM    "REFERENCE DATA"."Credit Facility".Restricted."v_creditFacilityLatest" c
     JOIN    "REFERENCE DATA".Client.Restricted."v_clientObligorGrade" o
            ON o.creditFacilityIdentifier = c.creditFacilityIdentifier
-    WHERE   c.creditFacilityIdentifier IN (:FACILITY_IDS)
+    WHERE   c.creditFacilityIdentifier IN (?)
       AND   c.creditFacilityStatusCode = 'Active'
 ),
-non_perf AS (                                   -- Q06
+non_perf AS (                       -- Q06
     SELECT DISTINCT facility_id
     FROM   aggdbo.V_FACILITY_DETAIL_ET
-    WHERE  TIME_INV_KEY          = :TIMEINVKEY
+    WHERE  TIME_INV_KEY          = ?
       AND  non_performing_status = 'Y'
       AND  en_amt               > 0
 ),
-property AS (                                   -- Q08 / 09
+property AS (                       -- Q08 / 09
     SELECT creditFacilityIdentifier AS facility_id,
            PROPERTY_TYPE_CODE
     FROM   "REFERENCE DATA"."Credit Facility".Restricted."v_creditFacilityLatest"
     WHERE  PROPERTY_TYPE_CODE IN (1811,1814,1834)
 ),
-exposure AS (                                   -- Q10 / 11
+exposure AS (                       -- Q10 / 11
     SELECT facility_id,
            SUM(approval_amt) AS total_exposure
     FROM   aggdbo.V_FACILITY_DETAIL_ET
-    WHERE  facility_id  IN (:FACILITY_IDS)
-      AND  TIME_INV_KEY = :TIMEINVKEY
-    GROUP BY facility_id
+    WHERE  facility_id  IN (?)
+      AND  TIME_INV_KEY = ?
+    GROUP  BY facility_id
 ),
-client_lookup AS (                              -- indirect Q04 / 36 / 47
+client_lookup AS (                  -- indirect Q04 / 36 / 47
     SELECT  ECI,
             NVL(shortName, name)        AS client_name,
             primaryCRUGroupIdentifier   AS cru_group,
             primaryCRUSectorIdentifier  AS cru_sector
     FROM    "REFERENCE DATA".Client.Restricted."v_creditClientConsumable"
-    WHERE   CIT_EOP_CONTEXT_KEY = :CONTEXT_KEY
+    WHERE   CIT_EOP_CONTEXT_KEY = ?
 )
 SELECT  fc.*,
-        r.sortNumber            AS facility_default_grade_enum,   -- Q13
+        r.sortNumber            AS facility_default_grade_enum,  -- Q13
         ox.obligor_grade,
-        CASE WHEN np.facility_id IS NULL THEN 'N' ELSE 'Y' END    AS non_performing_flag,
+        CASE WHEN np.facility_id IS NULL THEN 'N' ELSE 'Y' END   AS non_performing_flag,
         p.property_type_code,
         ex.total_exposure,
         cl.client_name,
@@ -215,6 +216,7 @@ LEFT JOIN   client_lookup cl  ON cl.ECI                      = fc.client_oid
 LEFT JOIN   REF_RISK_RATING_ENUM r ON r.gradeEX              = fc.facility_default_grade;
 
 
+
 /*======================================================================
   COVERAGE_DIM snapshot (covers Q14-15, 37)
 ======================================================================*/
@@ -225,11 +227,12 @@ SELECT  standardIdentifier,
         effectiveToDate
 FROM    "REFERENCE DATA".Coverage.Unrestricted."v_creditAuthority"
 WHERE   CURRENT_DATE BETWEEN effectiveFromDate AND effectiveToDate
-  AND   CRUnitIdentifier   IN (:CRU_LIST)
-  AND   standardIdentifier IN (:SID_FILTER)      -- '*' = all
+  AND   CRUnitIdentifier   IN (?)
+  AND   standardIdentifier IN (?)      -- '*' for all
   AND   REGEXP_LIKE(authorityRoleIdentifier, '^(B|C|C4|C5|C5A)')
 GROUP BY standardIdentifier,
          authorityRoleIdentifier,
          CRUnitIdentifier,
          effectiveFromDate,
          effectiveToDate;
+
